@@ -71,6 +71,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # REQUIRED. Without `workspaces:` this action looks for ONE Cargo workspace at the
+          # checkout root, and nothing is checked out there: every checkout above uses `path:`.
+          # It logged "could not find Cargo.toml" and carried on WITHOUT failing, so this job
+          # rebuilt everything from scratch on every run while the log said the cache step
+          # succeeded. Each workspace this job actually builds must be named.
+          workspaces: |
+            store-valkey-repo/store-valkey
+            busbarAI
       - name: cargo test -p busbar-store-valkey -- --ignored wipes_the_entire_namespace_destructively
         working-directory: store-valkey-repo/store-valkey
         env:
