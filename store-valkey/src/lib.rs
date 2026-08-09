@@ -70,7 +70,8 @@
 
 use busbar_api::{
     AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, MeteringDelta, MeteringRow,
-    ModelTokens, Store, StoreError, StoreResult, TierTokens, UsageDelta, UsageLedger, VirtualKey,
+    ModelTokens, Store, StoreError, StoreResult, TaskEventRow, TaskRow, TierTokens, UsageDelta,
+    UsageLedger, VirtualKey,
 };
 use redis::{Commands, Connection};
 use std::sync::Mutex;
@@ -123,6 +124,46 @@ const MCP_TS_MEMBER_SEP: char = '\u{1}';
 
 fn mcp_calls_key(principal: &str) -> String {
     format!("{MCP_CALLS_PREFIX}{principal}")
+}
+
+// ── THE DURABLE A2A TASK STORE ────────────────────────────────────────────────────────────────
+//
+// An A2A task spans turns, can sit interrupted waiting on a human, and can outlive the process that
+// started it, so an in-memory task table loses every in-flight task on restart -- the difference
+// between a resume that is real and one that is nominal.
+//
+// ONE STRING PER TASK, holding the whole row as JSON. This backend has no columns, so the SQL
+// backends' "every field its own column" becomes "the value IS the row"; the two things a caller
+// needs that a JSON blob cannot answer -- enumerate every task, and find a task's events -- get the
+// structures below.
+const TASK_PREFIX: &str = "busbar:task:";
+/// Every task id currently held. A SET, so `list_tasks` (which the contract defines as returning
+/// EVERY row, unfiltered) is one SMEMBERS rather than a SCAN of the whole keyspace on the hot path
+/// of a boot rehydrate.
+const TASKS_INDEX: &str = "busbar:tasks";
+/// One HASH per task, field = `seq` as decimal, value = the event row as JSON.
+///
+/// A HASH, NOT A ZSET SCORED BY `seq`, and the choice is load-bearing twice over. A ZSET score is an
+/// IEEE-754 double, so a `seq` above 2^53 would silently collide with its neighbours -- the exact
+/// class of silent-corruption this store exists not to do. And the contract requires an UPSERT on
+/// `(task_id, seq)`, which HSET is natively and a scored ZSET is only via a remove-then-add that is
+/// two round trips and a window. The cost is that ordering is restored in-process on read rather
+/// than by the server, which is bounded by one task's event count and is the right trade.
+const TASK_EVENTS_PREFIX: &str = "busbar:taskevents:";
+
+/// The task states that are TERMINAL, and therefore the only ones retention may drop. Named as a
+/// closed set rather than derived by negation on purpose: an unrecognised state token -- one a newer
+/// engine emits and this build has never heard of -- must read as NOT terminal, so a store compiled
+/// before a state existed cannot delete a task it does not understand. The wrong half to guess on is
+/// the deleting half.
+const TERMINAL_TASK_STATES: [&str; 4] = ["completed", "failed", "canceled", "rejected"];
+
+fn task_key(task_id: &str) -> String {
+    format!("{TASK_PREFIX}{task_id}")
+}
+
+fn task_events_key(task_id: &str) -> String {
+    format!("{TASK_EVENTS_PREFIX}{task_id}")
 }
 /// The signed-token REVOCATION denylist (1.5.0). `busbar:denylist:<sub>` holds the operator reason
 /// (a plain string), and `busbar:denylist` is a SET indexing every denied sub so `list_denylist` is
@@ -1594,6 +1635,162 @@ impl Store for ValkeyStore {
             }
         }
         Ok(removed)
+    }
+
+    fn put_task(&self, task: &TaskRow) -> StoreResult<()> {
+        // NOTE, and it is a real DIVERGENCE from sqlite/postgres/mysql rather than an oversight:
+        // those backends store `artifact_cursor`/`created_at`/`updated_at`/`seq`/`ts` in a SIGNED
+        // 64-bit column and must REFUSE a `u64` above `i64::MAX`, because such a value cannot read
+        // back as itself. Here the row is JSON, where a `u64` is exact across its whole range, so
+        // there is nothing to refuse and a refusal would be inventing a limit this backend does not
+        // have. `the_full_u64_range_round_trips_because_this_backend_has_no_signed_column` pins it.
+        let json = serde_json::to_string(task)
+            .map_err(|e| StoreError(format!("task encode failed: {e}")))?;
+        // UPSERT BY task_id: the engine writes through on EVERY state transition, so a second write
+        // for one task must REPLACE the row, never leave a second one. SET is that natively.
+        //
+        // One atomic pipeline: the row and its index entry must land together or not at all. A row
+        // present but unindexed is a task `list_tasks` cannot see, so a boot rehydrate silently
+        // loses it; an index entry with no row makes the same listing report a task that is gone.
+        self.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .set(task_key(&task.task_id), &json)
+                .ignore()
+                .sadd(TASKS_INDEX, &task.task_id)
+                .ignore()
+                .query(c)
+        })
+    }
+
+    fn get_task(&self, task_id: &str) -> StoreResult<Option<TaskRow>> {
+        // No principal filter, deliberately: the contract puts the caller-scoping check engine-side,
+        // because an authorization check living in the backend is one an unauthorized reader
+        // bypasses by configuring a different backend.
+        let raw: Option<String> = self.with_conn(|c| c.get(task_key(task_id)))?;
+        match raw {
+            None => Ok(None),
+            Some(raw) => serde_json::from_str(&raw)
+                .map(Some)
+                .map_err(|e| StoreError(format!("task decode failed: {e}"))),
+        }
+    }
+
+    fn list_tasks(&self) -> StoreResult<Vec<TaskRow>> {
+        // UNFILTERED, terminal rows included. The boot rehydrate wants the active rows, the
+        // retention sweep wants the terminal ones and the scoped listing wants one principal's; a
+        // store that pre-filtered for any one of those would break the other two.
+        let mut ids: Vec<String> = self.with_conn(|c| c.smembers(TASKS_INDEX))?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // A SET has no order; sort so the listing is deterministic across calls and nodes.
+        ids.sort();
+        // A PIPELINE of GETs rather than one MGET: MGET requires every key to live in the same hash
+        // slot, which holds on the single-node deployment this crate targets and stops holding the
+        // day somebody points it at a cluster. A pipeline is the same one round trip and has no
+        // cross-slot rule at all.
+        let raws: Vec<Option<String>> = self.with_conn(|c| {
+            let mut pipe = redis::pipe();
+            for id in &ids {
+                pipe.get(task_key(id));
+            }
+            pipe.query(c)
+        })?;
+        let mut out = Vec::with_capacity(raws.len());
+        for (id, raw) in ids.iter().zip(raws) {
+            // A `None` here is an index entry whose row is gone — the reverse of the pipeline's
+            // guarantee, reachable only if somebody deleted the row by hand. Skipped rather than
+            // errored: one hand-deleted key must not make the whole boot rehydrate unreadable. The
+            // stale index entry is swept by the next purge that reaches it.
+            let Some(raw) = raw else { continue };
+            let row: TaskRow = serde_json::from_str(&raw)
+                .map_err(|e| StoreError(format!("task decode failed for {id}: {e}")))?;
+            out.push(row);
+        }
+        Ok(out)
+    }
+
+    fn purge_tasks_before(&self, before: u64) -> StoreResult<u64> {
+        // A FULL PASS OVER THE TASK ROWS, and that is deliberate rather than the lazy option. The
+        // SQL backends push this predicate into the server; here the alternative would be a ZSET
+        // scored by `updated_at`, and a ZSET score is an IEEE-754 double — a timestamp above 2^53
+        // would sort against a value it is not equal to, so the sweep would silently keep or drop
+        // the wrong rows. There is also no score that can express "terminal", so a scored index
+        // would need this same row read anyway to check `state`. Since `list_tasks` is already
+        // specified as an every-row read that the boot rehydrate performs routinely, an every-row
+        // retention sweep is not a new cost class — and it is exact.
+        let rows = self.list_tasks()?;
+        let doomed: Vec<TaskRow> = rows
+            .into_iter()
+            // STRICTLY less-than, per the contract: a row exactly at the cutoff is kept. And an
+            // active or interrupted task is never dropped no matter how old — an interrupt waiting
+            // on a human is exactly the row that legitimately sits still for a long time.
+            .filter(|t| t.updated_at < before && TERMINAL_TASK_STATES.contains(&t.state.as_str()))
+            .collect();
+        let mut removed = 0u64;
+        for t in &doomed {
+            // The count REPORTED is taken from the DEL reply, never from the size of the candidate
+            // list: a concurrent sweep that got there first would otherwise make this over-report a
+            // deletion it did not perform.
+            //
+            // The task's provenance chain goes with it. That cascade is load-bearing:
+            // `purge_tasks_before` is the ONLY retention method the contract gives this data, so a
+            // purge that left the events behind would leave the event keyspace with no bound
+            // anywhere in the trait.
+            let n: u64 = self.with_conn(|c| {
+                redis::pipe()
+                    .atomic()
+                    .del(task_key(&t.task_id))
+                    .del(task_events_key(&t.task_id))
+                    .ignore()
+                    .srem(TASKS_INDEX, &t.task_id)
+                    .ignore()
+                    .query::<(u64,)>(c)
+                    .map(|(n,)| n)
+            })?;
+            removed += n;
+        }
+        Ok(removed)
+    }
+
+    fn append_task_event(&self, event: &TaskEventRow) -> StoreResult<()> {
+        let json = serde_json::to_string(event)
+            .map_err(|e| StoreError(format!("task event encode failed: {e}")))?;
+        // UPSERT ON (task_id, seq), and this is where the task-event contract genuinely DIFFERS from
+        // `append_mcp_call`'s a few methods above: that one treats an occupied slot holding a
+        // different record as a FORK and refuses it, while this one is specified to upsert so the
+        // engine's write-through is idempotent on replay — "rejecting or duplicating a replayed seq
+        // breaks the chain the engine will verify on read". Copying this file's own call-log fork
+        // check here would be wrong in a way that looks right.
+        //
+        // The field is `seq` in DECIMAL, so it is exact for the whole `u64` range; the store never
+        // computes or recomputes `hash`/`prev_hash`, it persists them verbatim inside the value.
+        self.with_conn(|c| {
+            c.hset::<_, _, _, ()>(
+                task_events_key(&event.task_id),
+                event.seq.to_string(),
+                &json,
+            )
+        })
+    }
+
+    fn list_task_events(&self, task_id: &str) -> StoreResult<Vec<TaskEventRow>> {
+        let fields: std::collections::HashMap<String, String> =
+            self.with_conn(|c| c.hgetall(task_events_key(task_id)))?;
+        let mut out = Vec::with_capacity(fields.len());
+        for raw in fields.values() {
+            let row: TaskEventRow = serde_json::from_str(raw)
+                .map_err(|e| StoreError(format!("task event decode failed: {e}")))?;
+            out.push(row);
+        }
+        // OLDEST-FIRST BY seq — the order the engine's chain verifier reads. Sorted here rather
+        // than by the server because the events live in a HASH (see TASK_EVENTS_PREFIX for why
+        // that beats a `seq`-scored ZSET), and sorted NUMERICALLY: the field names are decimal
+        // strings, so a lexicographic sort would place seq 10 before seq 2 and hand the verifier a
+        // chain that appears not to link.
+        out.sort_by_key(|e| e.seq);
+        Ok(out)
     }
 
     fn add_denylist(&self, sub: &str, reason: &str) -> StoreResult<()> {

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
-use busbar_api::{McpCallRecord, SecretForm};
+use busbar_api::{McpCallRecord, SecretForm, TaskEventRow, TaskRow};
 
 /// The password-scrub never lets the URL secret out in an error string, and the URL password
 /// extractor handles every URL shape.
@@ -156,6 +156,25 @@ fn unique_suffix() -> u64 {
 
 fn uid(base: &str) -> String {
     format!("{base}_{}", unique_suffix())
+}
+
+/// SERIALISES THE TESTS THAT RUN A GLOBAL RETENTION SWEEP against each other.
+///
+/// `purge_mcp_calls_before` and `purge_tasks_before` are global by timestamp — that is the contract,
+/// not a shortcut — and this suite deliberately shares ONE Valkey without wiping (see `live_store`)
+/// because a per-test wipe races every sibling. Key-namespace isolation, which is what every other
+/// test here relies on, cannot help: a sweep does not name the rows it removes, so one test's purge
+/// deletes another test's records between that test's append and its read. The symptom is a failure
+/// that reads as "retention quietly removed nothing" while the code is fine, and it moved from one
+/// test to another as the timestamp bands were shuffled — which is how it was diagnosed.
+///
+/// Non-sweeping tests need no lock: they place their rows ABOVE every cutoff any sweeping test uses,
+/// so no sweep can reach them. Only sweeping tests take this, and they hold it for their whole body.
+fn sweep_lock() -> std::sync::MutexGuard<'static, ()> {
+    static SWEEP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A panicking test poisons the mutex; recovering keeps ONE genuine failure from cascading into
+    // every other sweeping test reporting a poisoned lock instead of its own result.
+    SWEEP.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Like `uid`, but for the `bucket: u64` metering fields -- a distinct numeric bucket per call,
@@ -1517,6 +1536,7 @@ fn mcp_call_principals_are_enumerable_after_a_reconnect() {
 fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
     let Some(store) = live_store() else { return };
     let p = uid("vk_mcp_purge");
+    let _sweep = sweep_lock();
     // Retention is GLOBAL by ts, so this test cannot assert an exact global count against a shared
     // server; it asserts what it OWNS — its own principal's survivors and its own disappearance
     // from the enumeration — and that the reported count covers its own rows.
@@ -1608,6 +1628,7 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
 fn retention_still_finds_a_principal_whose_id_contains_the_separator_characters() {
     let Some(store) = live_store() else { return };
     let p = format!("{}:with:colons", uid("vk_mcp_sep"));
+    let _sweep = sweep_lock();
     store
         .append_mcp_call(&sample_call(&p, 1, 1_000_000_100, "", "h1"))
         .unwrap();
@@ -1620,5 +1641,414 @@ fn retention_still_finds_a_principal_whose_id_contains_the_separator_characters(
     assert!(
         store.list_mcp_calls(&p).unwrap().is_empty(),
         "a principal id containing the key-prefix separator must still purge correctly"
+    );
+}
+
+// ── THE DURABLE A2A TASK STORE ───────────────────────────────────────────────────────────────
+//
+// A2A is async by design: a task spans turns, can sit interrupted waiting on a human, and can
+// outlive the process that started it. So the property under test is not "put_task returned Ok" —
+// the trait's default `put_task` returns `Ok(())` and keeps nothing and `get_task` answers `None`
+// for everything, which is a backend that accepts every in-flight task and loses all of them on the
+// next deploy. The only honest proof is to READ THE TASK BACK ON A NEW CONNECTION after the writing
+// store is gone.
+//
+// This suite shares ONE Valkey with every other test in this file and does not wipe (see
+// `live_store`), so every task id here is `uid`-unique and no assertion is made about rows this test
+// did not write.
+
+fn sample_task(task_id: &str, state: &str, updated_at: u64) -> TaskRow {
+    TaskRow {
+        task_id: task_id.to_string(),
+        context_id: format!("ctx-{task_id}"),
+        principal: "vk_a".to_string(),
+        direction: "inbound".to_string(),
+        state: state.to_string(),
+        agent_id: "planner".to_string(),
+        artifact_cursor: 7,
+        push_callback: "https://example.test/push".to_string(),
+        created_at: 100,
+        updated_at,
+    }
+}
+
+fn sample_event(task_id: &str, seq: u64, kind: &str, prev_hash: &str, hash: &str) -> TaskEventRow {
+    TaskEventRow {
+        task_id: task_id.to_string(),
+        seq,
+        ts: seq.saturating_add(100),
+        kind: kind.to_string(),
+        context_id: format!("ctx-{task_id}"),
+        principal: "vk_a".to_string(),
+        agent_id: "planner".to_string(),
+        state: "working".to_string(),
+        request_id: format!("req-{seq}"),
+        prev_hash: prev_hash.to_string(),
+        hash: hash.to_string(),
+    }
+}
+
+/// THE TEST THAT MATTERS. A round-trip on one live handle cannot distinguish a backend that wrote to
+/// the server from one holding a HashMap behind the same trait — nor either of those from the
+/// trait's accept-and-keep-nothing defaults. So this DROPS the store, closing its connection
+/// entirely, then connects a genuinely new one and reads the task back off the server.
+#[test]
+fn an_in_flight_task_survives_dropping_the_store_and_reconnecting() {
+    let Some(store) = live_store() else { return };
+    let id = uid("t_restart");
+    store
+        .put_task(&sample_task(&id, "working", 3_000_000_100))
+        .unwrap();
+    // The write-through on a state transition REPLACES the row rather than appending a second one —
+    // an interrupted task waiting on a human is what a restart has to find.
+    let mut interrupted = sample_task(&id, "input-required", 3_000_000_200);
+    interrupted.artifact_cursor = 12;
+    store.put_task(&interrupted).unwrap();
+    drop(store);
+
+    let Some(reopened) = live_store() else { return };
+    let got = reopened.get_task(&id).unwrap().expect(
+        "an in-flight task must survive a reconnect; got None back from a new connection, which is \
+         the accept-and-keep-nothing default this backend exists to replace",
+    );
+
+    assert_eq!(got.state, "input-required", "the LAST state must win");
+    assert_eq!(
+        got.artifact_cursor, 12,
+        "the artifact cursor is where a resubscribe resumes; a stale one replays or loses the gap"
+    );
+    assert_eq!(got.context_id, format!("ctx-{id}"));
+    assert_eq!(got.principal, "vk_a");
+    assert_eq!(got.direction, "inbound");
+    assert_eq!(got.agent_id, "planner");
+    assert_eq!(got.push_callback, "https://example.test/push");
+    assert_eq!(got.created_at, 100);
+    assert_eq!(got.updated_at, 3_000_000_200);
+
+    // UPSERT, not append: two writes for one task_id leave ONE row in the listing.
+    let seen = reopened
+        .list_tasks()
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.task_id == id)
+        .count();
+    assert_eq!(
+        seen, 1,
+        "put_task upserts by task_id; it must never append a second row"
+    );
+
+    assert!(
+        reopened
+            .get_task(&uid("t_never_written"))
+            .unwrap()
+            .is_none(),
+        "an unknown task id reads back None, not an error"
+    );
+}
+
+/// `list_tasks` is deliberately UNFILTERED: terminal rows come back too. The boot rehydrate wants
+/// the active rows, the retention sweep wants the terminal ones and the scoped listing wants one
+/// principal's; a store that pre-filtered for any one of those would break the other two.
+#[test]
+fn list_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
+    let Some(store) = live_store() else { return };
+    let active = uid("t_list_active");
+    let waiting = uid("t_list_waiting");
+    let done = uid("t_list_done");
+    let failed = uid("t_list_failed");
+    // Far-future `updated_at`, so no retention sweep any other test runs can reach these rows.
+    store
+        .put_task(&sample_task(&active, "working", 4_000_000_000))
+        .unwrap();
+    store
+        .put_task(&sample_task(&waiting, "input-required", 4_000_000_000))
+        .unwrap();
+    store
+        .put_task(&sample_task(&done, "completed", 4_000_000_000))
+        .unwrap();
+    store
+        .put_task(&sample_task(&failed, "failed", 4_000_000_000))
+        .unwrap();
+    drop(store);
+
+    let Some(reopened) = live_store() else { return };
+    let ids: std::collections::BTreeSet<String> = reopened
+        .list_tasks()
+        .unwrap()
+        .into_iter()
+        .map(|t| t.task_id)
+        .collect();
+    for want in [&active, &waiting, &done, &failed] {
+        assert!(
+            ids.contains(want),
+            "list_tasks is unfiltered and durable: {want} must come back from a new connection, \
+             terminal or not — got {} row(s) and not this one",
+            ids.len()
+        );
+    }
+}
+
+/// The per-task provenance chain, read back on a new connection. Per-TASK rather than one global
+/// chain, so the scope of a read is one task and the links have to hold within it.
+#[test]
+fn a_task_event_chain_survives_a_reconnect_and_still_links() {
+    let Some(store) = live_store() else { return };
+    let id = uid("t_events");
+    let other = uid("t_events_other");
+    store
+        .append_task_event(&sample_event(&id, 1, "task.submitted", "", "e1"))
+        .unwrap();
+    store
+        .append_task_event(&sample_event(&id, 2, "task.working", "e1", "e2"))
+        .unwrap();
+    store
+        .append_task_event(&sample_event(&id, 3, "task.interrupted", "e2", "e3"))
+        .unwrap();
+    store
+        .append_task_event(&sample_event(&other, 1, "task.submitted", "", "f1"))
+        .unwrap();
+    drop(store);
+
+    let Some(reopened) = live_store() else { return };
+    let got = reopened.list_task_events(&id).unwrap();
+    assert_eq!(
+        got.len(),
+        3,
+        "the provenance chain must survive a reconnect; got {} events back from a new connection, \
+         which is the accept-and-keep-nothing default this backend exists to replace",
+        got.len()
+    );
+    assert_eq!(
+        got.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "oldest-first by seq, which is the order the chain verifier reads"
+    );
+    assert_eq!(got[0].prev_hash, "", "seq 1 opens the chain");
+    for w in got.windows(2) {
+        assert_eq!(
+            w[1].prev_hash, w[0].hash,
+            "the per-task chain must still link after a reconnect: seq {} carries prev_hash {:?} \
+             but seq {} persisted hash {:?}",
+            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+        );
+    }
+    assert_eq!(got[2].kind, "task.interrupted");
+    assert_eq!(got[2].request_id, "req-3");
+    assert_eq!(got[1].context_id, format!("ctx-{id}"));
+    assert_eq!(got[1].state, "working");
+    assert_eq!(got[1].ts, 102);
+    assert_eq!(
+        reopened.list_task_events(&other).unwrap().len(),
+        1,
+        "the scope of a read is ONE task; another task's chain must not leak into it"
+    );
+    assert!(
+        reopened
+            .list_task_events(&uid("t_no_events"))
+            .unwrap()
+            .is_empty(),
+        "a task with no events reads back empty, not an error"
+    );
+}
+
+/// A replayed `(task_id, seq)` UPSERTS. This is where the task-event contract genuinely DIFFERS from
+/// `append_mcp_call`'s, and the difference is invisible unless you assert it: the call log treats a
+/// different record at an occupied `seq` as a FORK and refuses it, while a task event is specified to
+/// upsert so the engine's write-through is idempotent on replay — "rejecting or duplicating a
+/// replayed `seq` breaks the chain the engine will verify on read". Copying this backend's own
+/// `append_mcp_call` here would be wrong in a way that looks right.
+#[test]
+fn a_replayed_task_event_upserts_rather_than_duplicating_or_erroring() {
+    let Some(store) = live_store() else { return };
+    let id = uid("t_replay");
+    let e = sample_event(&id, 1, "task.submitted", "", "e1");
+    store.append_task_event(&e).unwrap();
+    store
+        .append_task_event(&e)
+        .expect("an identical replay must succeed, not be rejected as a fork");
+    assert_eq!(
+        store.list_task_events(&id).unwrap().len(),
+        1,
+        "a replay must not duplicate the row"
+    );
+
+    let mut corrected = sample_event(&id, 1, "task.submitted", "", "e1-corrected");
+    corrected.state = "submitted".to_string();
+    store.append_task_event(&corrected).unwrap();
+    let got = store.list_task_events(&id).unwrap();
+    assert_eq!(got.len(), 1, "an upsert replaces; it does not append");
+    assert_eq!(got[0].hash, "e1-corrected");
+    assert_eq!(got[0].state, "submitted");
+}
+
+/// Retention drops TERMINAL rows only, strictly older than the cutoff, and reports a count it
+/// actually performed. An interrupted task waiting on a human is exactly the row that legitimately
+/// sits still for a long time; compacting it is losing the work, not reclaiming space.
+///
+/// The expected count is COMPUTED from `list_tasks` rather than hard-coded, because this suite
+/// shares one Valkey and a sibling test's rows can also qualify. Computing it keeps the assertion
+/// exact — "the number reported equals the number that genuinely qualified" — instead of weakening
+/// it to a `>=` that a no-op backend returning 0 could never fail but a wrong count could pass.
+#[test]
+fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
+    let Some(store) = live_store() else { return };
+    let _sweep = sweep_lock();
+    let cutoff = 1_000_000_000u64;
+    let mine_terminal: Vec<String> = ["completed", "failed", "canceled", "rejected"]
+        .iter()
+        .map(|s| {
+            let id = uid(&format!("t_purge_{s}"));
+            store.put_task(&sample_task(&id, s, cutoff - 100)).unwrap();
+            id
+        })
+        .collect();
+    // Old, and NOT terminal — never dropped, no matter how old.
+    let mine_kept: Vec<String> = ["submitted", "working", "input-required", "auth-required"]
+        .iter()
+        .map(|s| {
+            let id = uid(&format!("t_purge_{s}"));
+            store.put_task(&sample_task(&id, s, cutoff - 100)).unwrap();
+            id
+        })
+        .collect();
+    // Terminal but exactly AT the cutoff, and terminal but newer — both kept (`before` is strict).
+    let at_cutoff = uid("t_purge_at_cutoff");
+    store
+        .put_task(&sample_task(&at_cutoff, "completed", cutoff))
+        .unwrap();
+    let newer = uid("t_purge_newer");
+    store
+        .put_task(&sample_task(&newer, "completed", cutoff + 100))
+        .unwrap();
+
+    let terminal = ["completed", "failed", "canceled", "rejected"];
+    let expected = store
+        .list_tasks()
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.updated_at < cutoff && terminal.contains(&t.state.as_str()))
+        .count() as u64;
+    assert!(
+        expected >= 4,
+        "the four rows just written must be among those that qualify; got {expected}"
+    );
+
+    let purged = store.purge_tasks_before(cutoff).unwrap();
+    assert_eq!(
+        purged, expected,
+        "purge must report the number of rows it ACTUALLY removed, which is exactly the set that \
+         qualified — terminal and strictly older than the cutoff"
+    );
+    for id in &mine_terminal {
+        assert!(
+            store.get_task(id).unwrap().is_none(),
+            "{id} was terminal and old; it must be gone"
+        );
+    }
+    for id in &mine_kept {
+        assert!(
+            store.get_task(id).unwrap().is_some(),
+            "{id} is active or interrupted; retention must never drop it no matter how old"
+        );
+    }
+    assert!(
+        store.get_task(&at_cutoff).unwrap().is_some(),
+        "`before` is STRICTLY less-than: a row exactly at the cutoff is kept"
+    );
+    assert!(store.get_task(&newer).unwrap().is_some());
+    assert_eq!(
+        store.purge_tasks_before(cutoff).unwrap(),
+        0,
+        "re-running the same purge removes nothing"
+    );
+}
+
+/// Retention has to bound the EVENT keyspace too. The trait offers no `purge_task_events_before`, so
+/// if purging a task left its provenance behind, those keys would grow with no bound the contract
+/// provides any way to apply. Dropping a task therefore drops the chain that belongs to it — and
+/// drops nothing belonging to any other task.
+#[test]
+fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
+    let Some(store) = live_store() else { return };
+    let _sweep = sweep_lock();
+    // A ts band BELOW every other task test's, because `purge_tasks_before` is GLOBAL: this
+    // suite shares one Valkey and runs in parallel, so a cutoff above a sibling test's rows
+    // sweeps them out from under it. Bands here are disjoint and ordered so no test's cutoff
+    // can reach another test's rows.
+    let cutoff = 900_000_000u64;
+    let gone = uid("t_cascade_gone");
+    let stays = uid("t_cascade_stays");
+    store
+        .put_task(&sample_task(&gone, "completed", cutoff - 100))
+        .unwrap();
+    store
+        .put_task(&sample_task(&stays, "working", cutoff - 100))
+        .unwrap();
+    store
+        .append_task_event(&sample_event(&gone, 1, "task.submitted", "", "g1"))
+        .unwrap();
+    store
+        .append_task_event(&sample_event(&gone, 2, "task.completed", "g1", "g2"))
+        .unwrap();
+    store
+        .append_task_event(&sample_event(&stays, 1, "task.submitted", "", "s1"))
+        .unwrap();
+
+    assert!(store.purge_tasks_before(cutoff).unwrap() >= 1);
+    assert!(
+        store.list_task_events(&gone).unwrap().is_empty(),
+        "the purged task's events go with it; otherwise the event keyspace grows unbounded, \
+         because the contract offers no other way to purge it"
+    );
+    assert_eq!(
+        store.list_task_events(&stays).unwrap().len(),
+        1,
+        "another task's chain must be untouched by that purge"
+    );
+}
+
+/// A DIVERGENCE FROM THE SQL BACKENDS, asserted rather than left to be assumed. sqlite/postgres/mysql
+/// store these counters in a SIGNED 64-bit column, so a `u64` above `i64::MAX` cannot round-trip and
+/// those backends REFUSE it. This one encodes the whole row as JSON, where a `u64` is exact for its
+/// entire range, so there is nothing to refuse and inventing a refusal would be inventing a limit
+/// the backend does not have. The boundary that matters is therefore proven the other way round:
+/// `u64::MAX` goes in and comes back out unchanged.
+#[test]
+fn the_full_u64_range_round_trips_because_this_backend_has_no_signed_column() {
+    let Some(store) = live_store() else { return };
+    let id = uid("t_u64_max");
+    let mut t = sample_task(&id, "working", u64::MAX);
+    t.artifact_cursor = u64::MAX;
+    t.created_at = u64::MAX;
+    store.put_task(&t).unwrap();
+    store
+        .append_task_event(&sample_event(&id, u64::MAX, "task.working", "", "x"))
+        .unwrap();
+    drop(store);
+
+    let Some(reopened) = live_store() else { return };
+    let got = reopened
+        .get_task(&id)
+        .unwrap()
+        .expect("the row must be there");
+    assert_eq!(
+        got.artifact_cursor,
+        u64::MAX,
+        "an artifact cursor must not be clamped or wrapped"
+    );
+    assert_eq!(got.created_at, u64::MAX);
+    assert_eq!(got.updated_at, u64::MAX);
+    let events = reopened.list_task_events(&id).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].seq,
+        u64::MAX,
+        "a seq must not be clamped or wrapped"
+    );
+
+    // A `u64::MAX` updated_at is not "infinitely old" — retention must not reach it.
+    assert!(
+        reopened.get_task(&id).unwrap().is_some(),
+        "a far-future row must survive any purge cutoff below it"
     );
 }
