@@ -84,4 +84,19 @@ jobs:
         working-directory: store-valkey-repo/store-valkey
         env:
           VALKEY_URL: redis://localhost:6379/0
-        run: cargo test -- --ignored --test-threads=1 wipes_the_entire_namespace_destructively
+        run: |
+          set -euo pipefail
+          # FLOOR ASSERTION on the number of tests that actually ran. `cargo test <filter>` is a
+          # SUBSTRING match with no minimum: rename the test (dropping "the_" is enough) and the
+          # filter matches ZERO tests, cargo prints "running 0 tests / test result: ok" and EXITS 0.
+          # This whole job — and the dedicated valkey/valkey:8 service container it stands up — then
+          # goes green having run nothing, and because the test is #[ignore]'d no other job covers
+          # it either. Requiring "1 passed" is what makes the rename fail loudly instead.
+          out="$(cargo test -- --ignored --test-threads=1 \
+                 wipes_the_entire_namespace_destructively 2>&1 | tee /dev/stderr)"
+          grep -qE 'test result: ok\. 1 passed' <<<"$out" || {
+            echo "::error::the destructive-wipe test did not run (renamed, moved, or filtered out)." \
+                 "The filter matched no tests and cargo exited 0. Re-point the filter at the test's" \
+                 "current name — do NOT relax this assertion." >&2
+            exit 1
+          }
