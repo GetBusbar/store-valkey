@@ -43,9 +43,16 @@ jobs:
       # Read off the PUBLISHED artifact, not guessed from the crate name: the filename prefix and the
       # manifest name genuinely differ across this fleet (the store repos drop the trailing -plugin
       # that the auth repos keep, and store-valkey publishes as busbar-store-redis).
-      asset_prefix: busbar-store-redis
-      plugin_name: busbar-store-redis-plugin
-      plugin_alias: redis
+      # THE VALKEY IDENTITY, NOT THE RETIRED REDIS ONE. release.yml packs
+      # `--name busbar-store-valkey-plugin --alias valkey` and uploads
+      # busbar-store-valkey-<ver>-<target>.tar.gz, which is the stem busbar itself resolves
+      # (crates/busbar/src/config/mod.rs STORE_MODULE_VALKEY_ASSET_STEM). These three inputs were
+      # still naming the `redis` identity that v1.0.4 retired, so the consumer check was fetching
+      # an asset that has not existed since -- a gate aimed at a name nothing publishes cannot
+      # report on the artifact users actually get.
+      asset_prefix: busbar-store-valkey
+      plugin_name: busbar-store-valkey-plugin
+      plugin_alias: valkey
       plugin_kind: store
       # EMPTY, and correct: this repo publishes exactly one kind of artifact, a signed
       # busbar-store-*.tar.gz per target (see release.yml's `plugin-dist/*.tar.gz` upload) -- no
