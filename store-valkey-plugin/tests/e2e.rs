@@ -41,11 +41,39 @@ const TEST_SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef
 /// under `cargo test` (which builds the whole package including the cdylib target before running
 /// tests) it is always present, so this only guards against unusual invocations.
 fn plugin_path() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?; // .../target/<profile>/deps/e2e-<hash>
-    let profile_dir = exe.parent()?.parent()?; // .../target/<profile>
-    let name = plugin_library_filename("busbar_store_valkey_plugin");
-    let candidate = profile_dir.join(&name);
-    candidate.exists().then_some(candidate)
+    let candidate = (|| {
+        let exe = std::env::current_exe().ok()?; // .../target/<profile>/deps/e2e-<hash>
+        let profile_dir = exe.parent()?.parent()?; // .../target/<profile>
+        let name = plugin_library_filename("busbar_store_valkey_plugin");
+        // Check BOTH the "uplifted" <profile>/<name> copy and the raw <profile>/deps/<name>
+        // compiler output, newest wins: a bare `cargo test` does NOT uplift the cdylib to the
+        // top-level profile dir, only to deps/ (same fix already applied to store-postgres's,
+        // store-mysql's, auth-oidc's and webrequest-hook's equivalent helpers).
+        let uplifted = profile_dir.join(&name);
+        let raw = profile_dir.join("deps").join(&name);
+        [uplifted, raw]
+            .into_iter()
+            .filter_map(|p| {
+                std::fs::metadata(&p)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(|mtime| (p, mtime))
+            })
+            .max_by_key(|(_, mtime)| *mtime)
+            .map(|(p, _)| p)
+    })();
+    // Under CI a missing cdylib is a HARD FAILURE, never a silent skip — the same discipline
+    // `valkey_url()` below already applies, and the one every sibling plugin repo applies here.
+    // Without it the three tests gated on this helper skip to green in 0.00s when their subject
+    // disappears, which is the only over-the-ABI coverage of the valkey store path.
+    if candidate.is_none() && std::env::var_os("CI").is_some() {
+        panic!(
+            "the store-valkey plugin cdylib is not built under CI: `cargo test` must build it \
+             (checked both the uplifted target dir and target/deps). Refusing to silently skip \
+             the only over-the-ABI coverage of the durable Valkey store path."
+        );
+    }
+    candidate
 }
 
 /// The live `VALKEY_URL`, mirroring `busbar-store-valkey`'s own `live_store()` gating discipline
